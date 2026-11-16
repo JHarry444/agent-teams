@@ -1,0 +1,129 @@
+description: Generate a daily summary of repository activity and post as an issue
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  copilot-requests: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      copilot-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Generate daily activity report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_TOKEN }}
+        run: |
+          # Calculate time window (last 24 hours)
+          END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          START_TIME=$(date -u -d '24 hours ago' +"%Y-%m-%dT%H:%M:%SZ")
+          
+          echo "### Daily Activity Report" > /tmp/report.md
+          echo "" >> /tmp/report.md
+          echo "**Period:** ${START_TIME} to ${END_TIME} (UTC)" >> /tmp/report.md
+          echo "" >> /tmp/report.md
+          
+          # Get commits from last 24 hours
+          echo "## Recent Commits" >> /tmp/report.md
+          COMMITS=$(gh api repos/${{ github.repository }}/commits \
+            --paginate \
+            --jq '.[] | select(.commit.author.date >= "'${START_TIME}'" and .commit.author.date < "'${END_TIME}'") | "`\(.sha[0:7])` | \(.commit.author.name) | \(.commit.message | split("\n")[0])"' \
+            2>/dev/null | wc -l)
+          
+          if [ "$COMMITS" -gt 0 ]; then
+            gh api repos/${{ github.repository }}/commits \
+              --paginate \
+              --jq '.[] | select(.commit.author.date >= "'${START_TIME}'" and .commit.author.date < "'${END_TIME}'") | "- `\(.sha[0:7])` - \(.commit.author.name) - \(.commit.message | split("\n")[0])"' \
+              >> /tmp/report.md 2>/dev/null
+          else
+            echo "No commits in this period" >> /tmp/report.md
+          fi
+          
+          echo "" >> /tmp/report.md
+          
+          # Get PRs from last 24 hours
+          echo "## Pull Requests" >> /tmp/report.md
+          PRs=$(gh pr list --search "created:>${START_TIME}" --json number,title,state --limit 100 2>/dev/null)
+          PR_COUNT=$(echo "$PRs" | jq 'length' 2>/dev/null || echo 0)
+          
+          if [ "$PR_COUNT" -gt 0 ]; then
+            echo "$PRs" | jq -r '.[] | "- #\(.number) - \(.title) (\(.state))"' >> /tmp/report.md
+          else
+            echo "No PRs in this period" >> /tmp/report.md
+          fi
+          
+          echo "" >> /tmp/report.md
+          
+          # Get Issues from last 24 hours
+          echo "## Issues" >> /tmp/report.md
+          ISSUES=$(gh issue list --search "created:>${START_TIME}" --json number,title,state --limit 100 2>/dev/null)
+          ISSUE_COUNT=$(echo "$ISSUES" | jq 'length' 2>/dev/null || echo 0)
+          
+          if [ "$ISSUE_COUNT" -gt 0 ]; then
+            echo "$ISSUES" | jq -r '.[] | "- #\(.number) - \(.title) (\(.state))"' >> /tmp/report.md
+          else
+            echo "No issues in this period" >> /tmp/report.md
+          fi
+          
+          echo "" >> /tmp/report.md
+          echo "---" >> /tmp/report.md
+          echo "**Statistics:** $COMMITS commits | $PR_COUNT pull requests | $ISSUE_COUNT issues" >> /tmp/report.md
+          echo "" >> /tmp/report.md
+          echo "Generated at: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> /tmp/report.md
+          
+          cat /tmp/report.md
+      
+      - name: Create or update report issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPORT_FILE="/tmp/report.md"
+          REPORT_DATE=$(date -u +"%Y-%m-%d")
+          ISSUE_TITLE="Daily Activity Report: $REPORT_DATE"
+          ISSUE_BODY=$(cat "$REPORT_FILE")
+          
+          # Look for existing issue from today
+          EXISTING_ISSUE=$(gh issue list \
+            --search "in:title \"Daily Activity Report: $REPORT_DATE\"" \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+          
+          if [ -z "$EXISTING_ISSUE" ] || [ "$EXISTING_ISSUE" = "null" ]; then
+            # Create new issue
+            gh issue create \
+              --title "$ISSUE_TITLE" \
+              --body "$ISSUE_BODY" \
+              --label "report,automated"
+          else
+            # Close older issues from this workflow and create new one
+            OLD_ISSUES=$(gh issue list \
+              --search "in:title \"Daily Activity Report:\" label:report" \
+              --json number \
+              --jq '.[].number' 2>/dev/null || echo "")
+            
+            for OLD_ISSUE in $OLD_ISSUES; do
+              if [ "$OLD_ISSUE" != "$EXISTING_ISSUE" ]; then
+                gh issue close "$OLD_ISSUE" --reason "completed" 2>/dev/null || true
+              fi
+            done
+            
+            # Comment on today's issue with update
+            gh issue comment "$EXISTING_ISSUE" --body "$ISSUE_BODY" 2>/dev/null || \
+              gh issue create \
+                --title "$ISSUE_TITLE" \
+                --body "$ISSUE_BODY" \
+                --label "report,automated"
+          fi
